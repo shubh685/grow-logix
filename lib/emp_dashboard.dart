@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -7,6 +8,7 @@ import 'dart:ui' as ui;
 import 'package:ffi/ffi.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -15,6 +17,55 @@ import 'package:win32/win32.dart';
 
 import 'Log_In.dart';
 
+// ==================== FFI SIGNATURES ====================
+typedef _CreateCompatibleDC_C = IntPtr Function(IntPtr hdc);
+typedef _CreateCompatibleDC_Dart = int Function(int hdc);
+
+typedef _CreateCompatibleBitmap_C = IntPtr Function(IntPtr hdc, Int32 width, Int32 height);
+typedef _CreateCompatibleBitmap_Dart = int Function(int hdc, int width, int height);
+
+typedef _SelectObject_C = IntPtr Function(IntPtr hdc, IntPtr h);
+typedef _SelectObject_Dart = int Function(int hdc, int h);
+
+typedef _BitBlt_C = Int32 Function(IntPtr hdcDest, Int32 xDest, Int32 yDest, Int32 width,
+    Int32 height, IntPtr hdcSrc, Int32 xSrc, Int32 ySrc, Uint32 rop);
+typedef _BitBlt_Dart = int Function(int hdcDest, int xDest, int yDest, int width,
+    int height, int hdcSrc, int xSrc, int ySrc, int rop);
+
+typedef _DeleteDC_C = Int32 Function(IntPtr hdc);
+typedef _DeleteDC_Dart = int Function(int hdc);
+
+typedef _DeleteObject_C = Int32 Function(IntPtr ho);
+typedef _DeleteObject_Dart = int Function(int ho);
+
+typedef _GetDC_C = IntPtr Function(IntPtr hWnd);
+typedef _GetDC_Dart = int Function(int hWnd);
+
+typedef _ReleaseDC_C = Int32 Function(IntPtr hWnd, IntPtr hDC);
+typedef _ReleaseDC_Dart = int Function(int hWnd, int hDC);
+
+typedef _GetSystemMetrics_C = Int32 Function(Int32 nIndex);
+typedef _GetSystemMetrics_Dart = int Function(int nIndex);
+
+typedef _GetDIBits_C = Int32 Function(
+    IntPtr hdc,
+    IntPtr hbm,
+    Uint32 start,
+    Uint32 cLines,
+    Pointer<Uint8> lpvBits,
+    Pointer<BITMAPINFO> lpbmi,
+    Uint32 usage,
+    );
+typedef _GetDIBits_Dart = int Function(
+    int hdc,
+    int hbm,
+    int start,
+    int cLines,
+    Pointer<Uint8> lpvBits,
+    Pointer<BITMAPINFO> lpbmi,
+    int usage,
+    );
+
 class EmpDashboard extends StatefulWidget {
   const EmpDashboard({super.key});
 
@@ -22,21 +73,21 @@ class EmpDashboard extends StatefulWidget {
   State<EmpDashboard> createState() => _EmpDashboardState();
 }
 
-class _EmpDashboardState extends State<EmpDashboard> {
+class _EmpDashboardState extends State<EmpDashboard>
+    with WidgetsBindingObserver {
   static const String baseUrl = 'http://192.168.1.42/grow_logix';
   static const String liveStreamUrl = '$baseUrl/live_stream.php';
 
-  // ==================== SETTINGS ====================
-  static const int _captureIntervalMs = 60000; // ⭐ EVERY 1 MINUTE (60000ms)
-  static const int _jpegQuality = 55;
-  static const int _maxWidth = 1366;
-  static const String _permSetupKey = 'screen_perm_setup_done_v1';
+  // ⭐ CAPTURE INTERVAL: Every 5 seconds for near-live streaming
+  static const int _captureIntervalMs = 5000;
+  static const String _permSetupKey = 'screen_perm_setup_done_v6';
 
   bool _isLive = false;
+  Timer? _heartbeatTimer;
   DateTime? _sessionStartTime;
-  DateTime? _sessionEndTime;
   Duration _activeDuration = Duration.zero;
-  Duration _offlineDuration = Duration.zero;
+  Duration _offlineDuration = const Duration(minutes: 12, seconds: 45);
+
   Timer? _timer;
   Timer? _liveRequestTimer;
   Timer? _frameUploadTimer;
@@ -47,40 +98,54 @@ class _EmpDashboardState extends State<EmpDashboard> {
   String _role = 'Employee';
   String _email = '';
   int? _userId;
-  String _deviceId = 'Loading...';
   bool _isFetchingEmployee = true;
 
-  String _liveRequestStatus = 'idle';
-  bool _showLiveRequestDialog = false;
-  int _framesUploaded = 0;
   int _successfulUploads = 0;
+  int _failedUploads = 0;
   bool _isUploading = false;
   String _activeWindowTitle = 'Unknown';
-  String _captureMethod = 'none';
-  int _consecutiveFailures = 0;
+  String _captureMethod = 'ffi-win32';
+  String _lastCaptureError = '';
 
-  // PC Type verification
-  String? _pcType;
-  String? _pcNumber;
-  bool _showPcVerificationDialog = false;
+  String? _pcType = 'office';
+  String? _pcNumber = 'PC-01';
+
+  DynamicLibrary? _gdi32;
+  DynamicLibrary? _user32;
+
+  late _CreateCompatibleDC_Dart _createCompatibleDC;
+  late _CreateCompatibleBitmap_Dart _createCompatibleBitmap;
+  late _SelectObject_Dart _selectObject;
+  late _BitBlt_Dart _bitBlt;
+  late _DeleteDC_Dart _deleteDC;
+  late _DeleteObject_Dart _deleteObject;
+  late _GetDC_Dart _getDC;
+  late _ReleaseDC_Dart _releaseDC;
+  late _GetSystemMetrics_Dart _getSystemMetrics;
+  late _GetDIBits_Dart _getDIBits;
+  bool _ffiReady = false;
 
   final GlobalKey _repaintKey = GlobalKey();
-  int? _cachedForegroundHwnd;
-  String? _cachedPsScriptPath;
-  String _lastCaptureError = '';
+  final FocusNode _rootFocusNode = FocusNode(
+    skipTraversal: true,
+    canRequestFocus: false,
+  );
+
+  // Frame counter for server sync
+  int _frameCounter = 0;
 
   @override
   void initState() {
     super.initState();
-    _offlineDuration = const Duration(minutes: 12, seconds: 45);
+    _initFfi();
+    WidgetsBinding.instance.addObserver(this);
     _loadInitialUserData();
     _startLiveRequestPolling();
-
+    _startHeartbeat();
     _activeWindowTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (mounted && _isLive) _updateActiveWindowTitle();
     });
 
-    // ⭐ Check permission ONCE on app startup
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkAndRequestPermissionsIfNeeded();
     });
@@ -89,31 +154,123 @@ class _EmpDashboardState extends State<EmpDashboard> {
   @override
   void dispose() {
     _timer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    _heartbeatTimer?.cancel();
     _liveRequestTimer?.cancel();
     _frameUploadTimer?.cancel();
     _activeWindowTimer?.cancel();
-
-    if (_cachedPsScriptPath != null) {
-      try {
-        File(_cachedPsScriptPath!).deleteSync();
-      } catch (_) {}
-    }
+    _rootFocusNode.dispose();
     super.dispose();
   }
 
-  // ==================== ONE-TIME PERMISSION SETUP ====================
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _sendHeartbeat();
+        break;
+      case AppLifecycleState.paused:
+        break;
+      case AppLifecycleState.detached:
+        _sendShutdown();
+        break;
+      case AppLifecycleState.inactive:
+        break;
+      case AppLifecycleState.hidden:
+        break;
+    }
+  }
+
+  // ==================== HEARTBEAT ====================
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _sendHeartbeat();
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
+      if (mounted) _sendHeartbeat();
+    });
+  }
+
+  Future<void> _sendHeartbeat() async {
+    if (_employeeId.isEmpty || _employeeId == '---') return;
+    try {
+      await http
+          .post(
+        Uri.parse('$liveStreamUrl?action=heartbeat'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({'emp_id': _employeeId}),
+      )
+          .timeout(const Duration(seconds: 5));
+    } catch (e) {
+      debugPrint('Heartbeat error: $e');
+    }
+  }
+
+  Future<void> _sendShutdown() async {
+    if (_employeeId.isEmpty || _employeeId == '---') return;
+    try {
+      await http
+          .post(
+        Uri.parse('$liveStreamUrl?action=app_shutdown'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({'emp_id': _employeeId}),
+      )
+          .timeout(const Duration(seconds: 3));
+    } catch (e) {
+      debugPrint('Shutdown notify error: $e');
+    }
+  }
+
+  // ==================== INIT FFI ====================
+  void _initFfi() {
+    if (!Platform.isWindows) {
+      debugPrint('⚠️ FFI not initialized: not on Windows');
+      _captureMethod = 'flutter-only';
+      return;
+    }
+    try {
+      _gdi32 = DynamicLibrary.open('gdi32.dll');
+      _user32 = DynamicLibrary.open('user32.dll');
+
+      _createCompatibleDC = _gdi32!
+          .lookupFunction<_CreateCompatibleDC_C, _CreateCompatibleDC_Dart>(
+          'CreateCompatibleDC');
+      _createCompatibleBitmap = _gdi32!
+          .lookupFunction<_CreateCompatibleBitmap_C,
+          _CreateCompatibleBitmap_Dart>('CreateCompatibleBitmap');
+      _selectObject = _gdi32!
+          .lookupFunction<_SelectObject_C, _SelectObject_Dart>('SelectObject');
+      _bitBlt = _gdi32!.lookupFunction<_BitBlt_C, _BitBlt_Dart>('BitBlt');
+      _deleteDC =
+          _gdi32!.lookupFunction<_DeleteDC_C, _DeleteDC_Dart>('DeleteDC');
+      _deleteObject = _gdi32!
+          .lookupFunction<_DeleteObject_C, _DeleteObject_Dart>('DeleteObject');
+      _getDC = _user32!.lookupFunction<_GetDC_C, _GetDC_Dart>('GetDC');
+      _releaseDC =
+          _user32!.lookupFunction<_ReleaseDC_C, _ReleaseDC_Dart>('ReleaseDC');
+      _getSystemMetrics = _user32!
+          .lookupFunction<_GetSystemMetrics_C, _GetSystemMetrics_Dart>(
+          'GetSystemMetrics');
+      _getDIBits =
+          _gdi32!.lookupFunction<_GetDIBits_C, _GetDIBits_Dart>('GetDIBits');
+
+      _ffiReady = true;
+      debugPrint('✅ FFI loaded: gdi32.dll + user32.dll');
+    } catch (e) {
+      _ffiReady = false;
+      _captureMethod = 'flutter-only';
+      debugPrint('❌ FFI load failed: $e');
+    }
+  }
+
+  // ==================== ONE-TIME PERMISSION ====================
   Future<void> _checkAndRequestPermissionsIfNeeded() async {
     final prefs = await SharedPreferences.getInstance();
     final alreadyDone = prefs.getBool(_permSetupKey) ?? false;
-
-    if (alreadyDone) {
-      debugPrint('✅ Permission setup already completed — skipping');
-      return;
-    }
-
+    if (alreadyDone) return;
     if (!mounted) return;
 
-    // ⭐ Show one-time setup dialog
     await showDialog(
       context: context,
       barrierDismissible: false,
@@ -145,42 +302,19 @@ class _EmpDashboardState extends State<EmpDashboard> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Grow Logix needs permission to capture your screen for monitoring. This is a ONE-TIME setup.',
+              'Grow Logix needs permission to capture your screen. This is a ONE-TIME setup.',
               style: TextStyle(color: Colors.white70, fontSize: 13),
             ),
             const SizedBox(height: 16),
-            _permBullet('Screen capture access'),
-            _permBullet('Run PowerShell for native capture'),
-            _permBullet('Access temp folder for images'),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.blue.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.blue.withOpacity(0.3)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.info_outline, color: Colors.blueAccent, size: 18),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'You will NOT be asked again. Manager controls when recording starts/stops.',
-                      style: TextStyle(
-                          color: Colors.white.withOpacity(0.8), fontSize: 11),
-                    ),
-                  ),
-                ],
-              ),
-            ),
+            _permBullet('Native Win32 FFI screen capture'),
+            _permBullet('Continuous recording every 5 seconds'),
+            _permBullet('Store frames for manager review'),
           ],
         ),
         actions: [
           TextButton(
             onPressed: () async {
               Navigator.pop(ctx);
-              // Mark as done even if declined (to avoid nagging)
               await prefs.setBool(_permSetupKey, true);
             },
             child: const Text('Skip', style: TextStyle(color: Colors.white60)),
@@ -227,40 +361,31 @@ class _EmpDashboardState extends State<EmpDashboard> {
     final List<String> results = [];
 
     try {
-      // 1. Request storage permission (may not apply on Windows but safe)
       if (Platform.isAndroid || Platform.isIOS) {
-        final storageStatus = await Permission.storage.request();
-        final photosStatus = await Permission.photos.request();
-        results.add('Storage: ${storageStatus.isGranted}');
-        results.add('Photos: ${photosStatus.isGranted}');
+        final storage = await Permission.storage.request();
+        final photos = await Permission.photos.request();
+        results.add('Storage: ${storage.isGranted}');
+        results.add('Photos: ${photos.isGranted}');
       } else {
-        results.add('Storage: Platform-managed (Windows)');
+        results.add('Storage: ✅ Windows managed');
       }
 
-      // 2. Test PowerShell access
       try {
-        final psResult = await Process.run(
-          'powershell.exe',
-          ['-Command', 'Write-Output "OK"'],
-          runInShell: false,
-        ).timeout(const Duration(seconds: 10));
-
-        if (psResult.exitCode == 0 &&
-            psResult.stdout.toString().contains('OK')) {
-          results.add('PowerShell: ✅ OK');
+        final ffiTest = await _captureWindowsDesktopFFI();
+        if (ffiTest != null && ffiTest.isNotEmpty) {
+          results.add('FFI Win32 capture: ✅ OK');
         } else {
-          results.add('PowerShell: ❌ Failed');
+          results.add('FFI Win32 capture: ❌ Failed');
           allOk = false;
         }
       } catch (e) {
-        results.add('PowerShell: ❌ $e');
+        results.add('FFI Win32 capture: ❌ $e');
         allOk = false;
       }
 
-      // 3. Test temp folder write
       try {
         final tempDir = await getTemporaryDirectory();
-        final testFile = File('${tempDir.path}\\perm_test.txt');
+        final testFile = File('${tempDir.path}${Platform.pathSeparator}perm_test.txt');
         await testFile.writeAsString('test');
         await testFile.delete();
         results.add('Temp folder: ✅ OK');
@@ -269,25 +394,11 @@ class _EmpDashboardState extends State<EmpDashboard> {
         allOk = false;
       }
 
-      // 4. Test basic screen capture
-      try {
-        final captureTest = await _captureWindowsDesktopWin32();
-        if (captureTest != null && captureTest.isNotEmpty) {
-          results.add('Screen capture: ✅ OK');
-        } else {
-          results.add('Screen capture: ❌ Failed');
-          allOk = false;
-        }
-      } catch (e) {
-        results.add('Screen capture: ❌ $e');
-        allOk = false;
-      }
+      await _autoVerifyPcType('office');
 
-      // Save completion flag
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_permSetupKey, true);
 
-      // Show result
       if (mounted) {
         await showDialog(
           context: context,
@@ -305,7 +416,7 @@ class _EmpDashboardState extends State<EmpDashboard> {
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
-                    allOk ? 'Setup Complete' : 'Setup Completed with Warnings',
+                    allOk ? 'Setup Complete' : 'Completed with Warnings',
                     style: const TextStyle(
                         color: Colors.white,
                         fontWeight: FontWeight.bold,
@@ -332,8 +443,8 @@ class _EmpDashboardState extends State<EmpDashboard> {
                   backgroundColor: const Color(0xFFE94560),
                 ),
                 onPressed: () => Navigator.pop(ctx),
-                child: const Text('OK',
-                    style: TextStyle(color: Colors.white)),
+                child:
+                const Text('OK', style: TextStyle(color: Colors.white)),
               ),
             ],
           ),
@@ -344,23 +455,43 @@ class _EmpDashboardState extends State<EmpDashboard> {
     }
   }
 
-  // ==================== EXISTING HELPERS ====================
+  Future<void> _autoVerifyPcType(String pcType) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$liveStreamUrl?action=verify_pc_type'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({'emp_id': _employeeId, 'pc_type': pcType}),
+      );
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['status'] == 'success') {
+          setState(() {
+            _pcType = pcType;
+            _pcNumber = data['pc_number'] ??
+                (pcType == 'office' ? 'PC-01' : 'Personal PC');
+          });
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('pc_type', pcType);
+          await prefs.setString('pc_number', _pcNumber ?? '');
+        }
+      }
+    } catch (e) {
+      debugPrint('Auto verify PC type error: $e');
+    }
+  }
+
+  // ==================== HELPERS ====================
   void _updateActiveWindowTitle() {
     if (!Platform.isWindows) return;
     try {
       final hwnd = GetForegroundWindow();
       if (hwnd == 0) return;
-
       final length = GetWindowTextLength(hwnd);
       if (length == 0) return;
-
       final buffer = wsalloc(length + 1);
       GetWindowText(hwnd, buffer, length + 1);
       final title = buffer.toDartString();
       free(buffer);
-
-      _cachedForegroundHwnd = hwnd;
-
       if (mounted && title != _activeWindowTitle) {
         setState(() => _activeWindowTitle = title);
       }
@@ -371,29 +502,24 @@ class _EmpDashboardState extends State<EmpDashboard> {
 
   Future<void> _loadInitialUserData() async {
     final prefs = await SharedPreferences.getInstance();
-
     setState(() {
       _userId = prefs.getInt('user_id');
       _employeeName = prefs.getString('user_name') ?? 'Employee';
       _employeeId = prefs.getString('emp_id') ?? 'GS-E-00';
       _role = prefs.getString('user_role') ?? 'Employee';
       _email = prefs.getString('user_email') ?? '';
-      _deviceId = prefs.getString('device_id') ?? 'Loading...';
-      _pcType = prefs.getString('pc_type');
-      _pcNumber = prefs.getString('pc_number');
+      _pcType = prefs.getString('pc_type') ?? 'office';
+      _pcNumber = prefs.getString('pc_number') ?? 'PC-01';
     });
-
     await _fetchEmployeeDetailsFromBackend();
   }
 
   Future<void> _fetchEmployeeDetailsFromBackend() async {
     try {
-      final Uri fetchUri = Uri.parse(
+      final fetchUri = Uri.parse(
           '$baseUrl/manage_employee.php?emp_id=$_employeeId&user_id=${_userId ?? ''}');
-
       final response = await http.get(fetchUri,
           headers: {'Content-Type': 'application/json'});
-
       if (response.statusCode == 200) {
         final resData = jsonDecode(response.body);
         if (resData['status'] == 'success' && resData['data'] != null) {
@@ -416,6 +542,7 @@ class _EmpDashboardState extends State<EmpDashboard> {
     }
   }
 
+  // ==================== POLLING ====================
   void _startLiveRequestPolling() {
     _liveRequestTimer?.cancel();
     _liveRequestTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
@@ -430,26 +557,17 @@ class _EmpDashboardState extends State<EmpDashboard> {
 
   Future<void> _checkForLiveRequest() async {
     if (_employeeId.isEmpty || _employeeId == '---') return;
-
     try {
       final response = await http.get(
         Uri.parse('$liveStreamUrl?action=check_live_request&emp_id=$_employeeId'),
         headers: {'Accept': 'application/json'},
       );
-
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         final status = data['status'] ?? 'idle';
-
-        if (status == 'requested' &&
-            !_showLiveRequestDialog &&
-            !_showPcVerificationDialog &&
-            mounted) {
-          _liveRequestStatus = status;
-          _showLiveRequestDialog = true;
-          _showIncomingLiveRequestDialog();
-        } else if (status == 'idle' && _liveRequestStatus != 'idle') {
-          setState(() => _liveRequestStatus = 'idle');
+        if (status == 'requested' && !_isLive) {
+          debugPrint('🎬 Manager requested — AUTO-STARTING');
+          _startLive();
         }
       }
     } catch (e) {
@@ -459,19 +577,16 @@ class _EmpDashboardState extends State<EmpDashboard> {
 
   Future<void> _checkIfManagerStopped() async {
     if (!_isLive || _employeeId.isEmpty) return;
-
     try {
       final response = await http.get(
         Uri.parse('$liveStreamUrl?action=check_live_request&emp_id=$_employeeId'),
         headers: {'Accept': 'application/json'},
       );
-
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         final status = data['status'] ?? 'idle';
-
         if (status == 'idle' && _isLive) {
-          debugPrint('Manager stopped the stream — auto-stopping');
+          debugPrint('🛑 Manager stopped — AUTO-STOPPING');
           _stopLiveByManager();
         }
       }
@@ -480,300 +595,21 @@ class _EmpDashboardState extends State<EmpDashboard> {
     }
   }
 
-  // ==================== PC VERIFICATION ====================
-  void _showPcVerificationQuestion() {
-    if (!mounted) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF16213E),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: Colors.blueAccent.withOpacity(0.15),
-              ),
-              child: const Icon(Icons.computer, color: Colors.blueAccent, size: 24),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(
-              child: Text('PC Type Verification',
-                  style: TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 18)),
-            ),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Are you using an Office PC or Personal PC?',
-                style: TextStyle(color: Colors.white70, fontSize: 14)),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.05),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.white.withOpacity(0.1)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.info_outline, color: Colors.amber, size: 18),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'This helps us assign the correct PC number for monitoring.',
-                      style: TextStyle(
-                          color: Colors.white.withOpacity(0.7), fontSize: 12),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton.icon(
-            onPressed: () {
-              Navigator.pop(context);
-              _showPcVerificationDialog = false;
-              _verifyPcType('personal');
-            },
-            icon: const Icon(Icons.laptop_mac,
-                color: Colors.lightBlueAccent, size: 20),
-            label: const Text('Personal PC',
-                style: TextStyle(color: Colors.lightBlueAccent)),
-          ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFFE94560),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-            onPressed: () {
-              Navigator.pop(context);
-              _showPcVerificationDialog = false;
-              _verifyPcType('office');
-            },
-            icon: const Icon(Icons.computer, color: Colors.white, size: 20),
-            label: const Text('Office PC',
-                style: TextStyle(
-                    color: Colors.white, fontWeight: FontWeight.bold)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _verifyPcType(String pcType) async {
-    try {
-      final response = await http.post(
-        Uri.parse('$liveStreamUrl?action=verify_pc_type'),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({
-          'emp_id': _employeeId,
-          'pc_type': pcType,
-        }),
-      );
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        if (data['status'] == 'success') {
-          setState(() {
-            _pcType = pcType;
-            _pcNumber = data['pc_number'] ??
-                (pcType == 'office' ? 'PC-01' : 'Personal PC');
-          });
-
-          final prefs = await SharedPreferences.getInstance();
-          await prefs.setString('pc_type', pcType);
-          await prefs.setString('pc_number', _pcNumber ?? '');
-
-          if (mounted && _liveRequestStatus == 'requested') {
-            _showIncomingLiveRequestDialog();
-          }
-        }
-      }
-    } catch (e) {
-      debugPrint('Error verifying PC type: $e');
-      setState(() {
-        _pcType = pcType;
-        _pcNumber = pcType == 'office' ? 'PC-01' : 'Personal PC';
-      });
-    }
-  }
-
-  void _showIncomingLiveRequestDialog() {
-    if (!mounted) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF16213E),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: Colors.greenAccent.withOpacity(0.15),
-              ),
-              child: const Icon(Icons.videocam,
-                  color: Colors.greenAccent, size: 24),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(
-              child: Text('Live Screen Request',
-                  style: TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 18)),
-            ),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Your manager wants to view your FULL DESKTOP screen.',
-                style: TextStyle(color: Colors.white70, fontSize: 14)),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.05),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.white.withOpacity(0.1)),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      const Icon(Icons.info_outline,
-                          color: Colors.amber, size: 18),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Screen will be captured EVERY 1 MINUTE and saved. Manager controls start/stop.',
-                          style: TextStyle(
-                              color: Colors.white.withOpacity(0.7),
-                              fontSize: 12),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Icon(
-                        _pcType == 'office'
-                            ? Icons.computer
-                            : Icons.laptop_mac,
-                        color: _pcType == 'office'
-                            ? Colors.greenAccent
-                            : Colors.lightBlueAccent,
-                        size: 16,
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Device: ${_pcNumber ?? "Unknown"}',
-                        style: TextStyle(
-                          color: _pcType == 'office'
-                              ? Colors.greenAccent
-                              : Colors.lightBlueAccent,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () async {
-              Navigator.pop(context);
-              _showLiveRequestDialog = false;
-              setState(() => _liveRequestStatus = 'idle');
-              await _declineLiveRequest();
-            },
-            child:
-            const Text('Decline', style: TextStyle(color: Colors.white60)),
-          ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFFE94560),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-            onPressed: () {
-              Navigator.pop(context);
-              _showLiveRequestDialog = false;
-              _acceptLiveRequest();
-            },
-            icon: const Icon(Icons.play_arrow, color: Colors.white, size: 20),
-            label: const Text('Accept & Go Live',
-                style: TextStyle(
-                    color: Colors.white, fontWeight: FontWeight.bold)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _declineLiveRequest() async {
-    try {
-      await http.post(
-        Uri.parse('$liveStreamUrl?action=stop_live_stream'),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({'emp_id': _employeeId}),
-      );
-      _liveRequestStatus = 'idle';
-    } catch (e) {
-      debugPrint('Error declining live request: $e');
-    }
-  }
-
-  void _acceptLiveRequest() {
-    if (_pcType == null) {
-      _showPcVerificationDialog = true;
-      _showPcVerificationQuestion();
-    } else {
-      _startLive();
-    }
-  }
-
-  // ==================== LIVE STREAMING (Employee — AUTO START ONLY) ====================
+  // ==================== LIVE STREAMING ====================
   void _startLive() {
     if (_isLive) return;
-
     setState(() {
       _isLive = true;
       _sessionStartTime = DateTime.now();
-      _sessionEndTime = null;
       _activeDuration = Duration.zero;
-      _liveRequestStatus = 'streaming';
-      _framesUploaded = 0;
       _successfulUploads = 0;
+      _failedUploads = 0;
       _isUploading = false;
-      _consecutiveFailures = 0;
       _lastCaptureError = '';
+      _frameCounter = 0;
     });
 
+    // Duration counter
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (mounted && _isLive) {
@@ -783,36 +619,37 @@ class _EmpDashboardState extends State<EmpDashboard> {
       }
     });
 
-    _startRealTimeCaptureLoop();
+    // ⭐ START CONTINUOUS CAPTURE
+    _startCaptureLoop();
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('🔴 Screen recording started — captures every 1 minute'),
-        backgroundColor: Colors.green,
-        duration: Duration(seconds: 3),
-      ),
-    );
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+              '🔴 Continuous recording started — captures every 5 seconds'),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 3),
+        ),
+      );
+    }
   }
 
-  /// ⭐ Called ONLY when manager stops (from polling)
   void _stopLiveByManager() {
     if (!_isLive) return;
-
     _timer?.cancel();
     _frameUploadTimer?.cancel();
+    _frameUploadTimer = null;
 
     setState(() {
       _isLive = false;
-      _sessionEndTime = DateTime.now();
       _offlineDuration = _offlineDuration + _activeDuration;
-      _liveRequestStatus = 'idle';
     });
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-              'Manager stopped the stream. $_successfulUploads frames saved.'),
+              'Manager stopped. $_successfulUploads frames captured, $_failedUploads failed.'),
           backgroundColor: const Color(0xFFE94560),
           duration: const Duration(seconds: 3),
         ),
@@ -820,46 +657,75 @@ class _EmpDashboardState extends State<EmpDashboard> {
     }
   }
 
-  // ==================== EVERY-MINUTE CAPTURE LOOP ====================
-  void _startRealTimeCaptureLoop() {
+  // ⭐ CONTINUOUS CAPTURE LOOP — captures every 5 seconds
+  void _startCaptureLoop() {
+    // Cancel any existing timer
     _frameUploadTimer?.cancel();
+    _frameUploadTimer = null;
 
-    // ⭐ Immediate first capture
+    // Immediate first capture
+    debugPrint('🎬 STARTING CAPTURE LOOP (interval: ${_captureIntervalMs}ms)');
     _captureAndUpload();
 
-    // ⭐ Then EVERY 1 MINUTE
+    // Then capture continuously every 5 seconds
     _frameUploadTimer = Timer.periodic(
       const Duration(milliseconds: _captureIntervalMs),
           (timer) async {
+        debugPrint('⏰ Timer tick at ${DateTime.now()}');
         if (!mounted || !_isLive) {
+          debugPrint('⏹️ Stopping capture loop (mounted: $mounted, live: $_isLive)');
           timer.cancel();
           return;
         }
-        if (_isUploading) return;
+        if (_isUploading) {
+          debugPrint('⏭️ Skipping frame — previous upload still in progress');
+          return;
+        }
         await _captureAndUpload();
       },
     );
+
+    debugPrint('✅ Capture loop timer created');
   }
 
   Future<void> _captureAndUpload() async {
-    if (!_isLive || _isUploading) return;
+    if (!_isLive) {
+      debugPrint('⏭️ Not live — skipping capture');
+      return;
+    }
+    if (_isUploading) {
+      debugPrint('⏭️ Upload already in progress');
+      return;
+    }
+
     _isUploading = true;
+    _frameCounter++;
+    final captureNum = _successfulUploads + 1;
+    debugPrint('📸 Capturing frame #$captureNum (counter: $_frameCounter)...');
 
     try {
       _updateActiveWindowTitle();
 
-      final String? frameData = await _captureFullDesktop();
+      // PRIMARY: Win32 FFI capture
+      String? frameData = await _captureWindowsDesktopFFI();
+
+      // Fallback: Flutter widget
+      if (frameData == null || frameData.isEmpty) {
+        debugPrint('⚠️ FFI failed, using Flutter fallback');
+        _captureMethod = 'flutter-fallback';
+        frameData = await _captureFlutterWidget();
+      }
 
       if (frameData == null || frameData.isEmpty) {
-        _consecutiveFailures++;
-        debugPrint(
-            'Screen capture empty (failures: $_consecutiveFailures) — $_lastCaptureError');
+        _lastCaptureError = 'All capture methods failed';
+        _failedUploads++;
+        debugPrint('❌ No frame data captured');
         return;
       }
 
-      _consecutiveFailures = 0;
+      debugPrint('✅ Captured ${frameData.length} chars');
 
-      // ⭐ ALWAYS save to history (every 1 min capture = 1 history frame)
+      // Upload to server
       final response = await http
           .post(
         Uri.parse('$liveStreamUrl?action=upload_screen_frame'),
@@ -867,300 +733,189 @@ class _EmpDashboardState extends State<EmpDashboard> {
         body: json.encode({
           'emp_id': _employeeId,
           'image_base64': frameData,
-          'save_history': true, // ALWAYS save (every-minute frames)
+          'save_history': true,
           'window_title': _activeWindowTitle,
-          'pc_type': _pcType ?? 'personal',
-          'pc_number': _pcNumber ?? 'Personal PC',
+          'pc_type': _pcType ?? 'office',
+          'pc_number': _pcNumber ?? 'PC-01',
           'is_live_frame': true,
+          'frame_counter': _frameCounter,
         }),
       )
-          .timeout(const Duration(seconds: 20));
+          .timeout(const Duration(seconds: 60));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         if (data['status'] == 'success') {
           _successfulUploads++;
-          _framesUploaded++;
+          _lastCaptureError = '';
+          debugPrint('✅ Frame #$captureNum uploaded (server ack)');
           if (mounted) setState(() {});
+        } else {
+          _failedUploads++;
+          debugPrint('❌ Server rejected frame: ${data['message']}');
+          _lastCaptureError = data['message'] ?? 'Server rejected';
         }
+      } else {
+        _failedUploads++;
+        debugPrint('❌ HTTP ${response.statusCode}');
+        _lastCaptureError = 'HTTP ${response.statusCode}';
       }
     } catch (e) {
-      _consecutiveFailures++;
-      debugPrint('Capture/upload error (#$_consecutiveFailures): $e');
+      _failedUploads++;
+      _lastCaptureError = '$e';
+      debugPrint('❌ Capture/upload error: $e');
     } finally {
       _isUploading = false;
     }
   }
 
-  Future<String?> _captureFullDesktop() async {
-    if (Platform.isWindows) {
-      final nativeResult = await _captureWindowsDesktopWin32();
-      if (nativeResult != null && nativeResult.isNotEmpty) {
-        return nativeResult;
-      }
-      debugPrint('⚠️ Native capture FAILED: $_lastCaptureError');
+  // ==================== PURE FFI WIN32 CAPTURE ====================
+  Future<String?> _captureWindowsDesktopFFI() async {
+    if (!Platform.isWindows || !_ffiReady) {
+      if (!_ffiReady) _lastCaptureError = 'FFI not loaded';
+      return null;
     }
 
-    if (Platform.isMacOS) return await _captureMacDesktop();
-    if (Platform.isLinux) return await _captureLinuxDesktop();
+    Pointer<BITMAPINFO>? bmi;
+    Pointer<Uint8>? pixelData;
+    int hdcScreen = 0;
+    int hdcMem = 0;
+    int hBitmap = 0;
+    int hOld = 0;
 
-    _captureMethod = 'flutter-fallback';
-    return await _captureFlutterWidget();
-  }
-
-  Future<String?> _captureWindowsDesktopWin32() async {
     try {
-      final tempDir = await getTemporaryDirectory();
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final tempPath = '${tempDir.path}\\screen_$timestamp.jpg';
-      final scriptPath = '${tempDir.path}\\capture_$timestamp.ps1';
-      final tempPathEscaped = tempPath.replaceAll('\\', '\\\\');
+      const SM_CXSCREEN = 0;
+      const SM_CYSCREEN = 1;
+      final width = _getSystemMetrics(SM_CXSCREEN);
+      final height = _getSystemMetrics(SM_CYSCREEN);
 
-      final psScript = '''
-\$ErrorActionPreference = "Stop"
-try {
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
+      if (width <= 0 || height <= 0) {
+        _lastCaptureError = 'Invalid screen size: ${width}x$height';
+        return null;
+      }
 
-    Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class NativeWin32 {
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")]
-    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-    [DllImport("user32.dll")]
-    public static extern int GetWindowTextLength(IntPtr hWnd);
-    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-    public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-    }
-}
-"@
+      hdcScreen = _getDC(0);
+      if (hdcScreen == 0) {
+        _lastCaptureError = 'GetDC returned NULL';
+        return null;
+      }
 
-    \$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-    \$screenWidth = \$screen.Width
-    \$screenHeight = \$screen.Height
+      hdcMem = _createCompatibleDC(hdcScreen);
+      if (hdcMem == 0) {
+        _lastCaptureError = 'CreateCompatibleDC failed';
+        return null;
+      }
 
-    \$targetWidth = $_maxWidth
-    \$scale = 1.0
-    if (\$screenWidth -gt \$targetWidth) {
-        \$scale = \$targetWidth / \$screenWidth
-    }
-    \$newWidth = [int](\$screenWidth * \$scale)
-    \$newHeight = [int](\$screenHeight * \$scale)
+      hBitmap = _createCompatibleBitmap(hdcScreen, width, height);
+      if (hBitmap == 0) {
+        _lastCaptureError = 'CreateCompatibleBitmap failed';
+        return null;
+      }
 
-    \$bitmap = New-Object System.Drawing.Bitmap \$screenWidth, \$screenHeight
-    \$graphics = [System.Drawing.Graphics]::FromImage(\$bitmap)
-    \$graphics.CopyFromScreen(\$screen.X, \$screen.Y, 0, 0, \$bitmap.Size)
+      hOld = _selectObject(hdcMem, hBitmap);
 
-    \$hwnd = [NativeWin32]::GetForegroundWindow()
+      const SRCCOPY = 0x00CC0020;
+      final bitBltResult =
+      _bitBlt(hdcMem, 0, 0, width, height, hdcScreen, 0, 0, SRCCOPY);
+      if (bitBltResult == 0) {
+        _lastCaptureError = 'BitBlt failed';
+        return null;
+      }
 
-    if (\$hwnd -ne [IntPtr]::Zero) {
-        \$rect = New-Object NativeWin32+RECT
-        [NativeWin32]::GetWindowRect(\$hwnd, [ref]\$rect) | Out-Null
+      final bufSize = width * height * 4;
+      pixelData = calloc<Uint8>(bufSize);
 
-        \$windowWidth = \$rect.Right - \$rect.Left
-        \$windowHeight = \$rect.Bottom - \$rect.Top
+      bmi = calloc<BITMAPINFO>();
+      bmi.ref.bmiHeader.biSize = sizeOf<BITMAPINFOHEADER>();
+      bmi.ref.bmiHeader.biWidth = width;
+      bmi.ref.bmiHeader.biHeight = -height;
+      bmi.ref.bmiHeader.biPlanes = 1;
+      bmi.ref.bmiHeader.biBitCount = 32;
+      bmi.ref.bmiHeader.biCompression = 0;
+      bmi.ref.bmiHeader.biSizeImage = bufSize;
+      bmi.ref.bmiHeader.biXPelsPerMeter = 0;
+      bmi.ref.bmiHeader.biYPelsPerMeter = 0;
+      bmi.ref.bmiHeader.biClrUsed = 0;
+      bmi.ref.bmiHeader.biClrImportant = 0;
 
-        \$pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::Yellow), 5
-        \$graphics.DrawRectangle(\$pen, \$rect.Left, \$rect.Top, \$windowWidth, \$windowHeight)
+      const DIB_RGB_COLORS = 0;
+      final getDIBitsResult = _getDIBits(
+          hdcMem, hBitmap, 0, height, pixelData, bmi, DIB_RGB_COLORS);
 
-        \$cs = 25
-        \$cpen = New-Object System.Drawing.Pen ([System.Drawing.Color]::Yellow), 8
-        \$graphics.DrawLine(\$cpen, \$rect.Left, \$rect.Top, \$rect.Left + \$cs, \$rect.Top)
-        \$graphics.DrawLine(\$cpen, \$rect.Left, \$rect.Top, \$rect.Left, \$rect.Top + \$cs)
-        \$graphics.DrawLine(\$cpen, \$rect.Right - \$cs, \$rect.Top, \$rect.Right, \$rect.Top)
-        \$graphics.DrawLine(\$cpen, \$rect.Right, \$rect.Top, \$rect.Right, \$rect.Top + \$cs)
-        \$graphics.DrawLine(\$cpen, \$rect.Left, \$rect.Bottom - \$cs, \$rect.Left, \$rect.Bottom)
-        \$graphics.DrawLine(\$cpen, \$rect.Left, \$rect.Bottom, \$rect.Left + \$cs, \$rect.Bottom)
-        \$graphics.DrawLine(\$cpen, \$rect.Right - \$cs, \$rect.Bottom, \$rect.Right, \$rect.Bottom)
-        \$graphics.DrawLine(\$cpen, \$rect.Right, \$rect.Bottom - \$cs, \$rect.Right, \$rect.Bottom)
+      if (getDIBitsResult == 0) {
+        _lastCaptureError = 'GetDIBits failed';
+        return null;
+      }
 
-        \$titleLength = [NativeWin32]::GetWindowTextLength(\$hwnd)
-        \$title = ""
-        if (\$titleLength -gt 0) {
-            \$sb = New-Object System.Text.StringBuilder (\$titleLength + 1)
-            [NativeWin32]::GetWindowText(\$hwnd, \$sb, \$sb.Capacity) | Out-Null
-            \$title = \$sb.ToString()
-        }
+      final pixels = pixelData.asTypedList(bufSize);
+      // BGRA -> RGBA conversion
+      for (int i = 0; i < bufSize; i += 4) {
+        final b = pixels[i];
+        final g = pixels[i + 1];
+        final r = pixels[i + 2];
+        pixels[i] = r;
+        pixels[i + 1] = g;
+        pixels[i + 2] = b;
+        pixels[i + 3] = 255;
+      }
 
-        if (\$title.Length -gt 0) {
-            \$tfont = New-Object System.Drawing.Font("Arial", 12, [System.Drawing.FontStyle]::Bold)
-            \$tbg = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(220, 0, 0, 0))
-            \$tfg = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::Yellow)
-            if (\$title.Length -gt 70) { \$title = \$title.Substring(0, 67) + "..." }
-            \$tsize = \$graphics.MeasureString(\$title, \$tfont)
-            \$tx = [Math]::Max(0, \$rect.Left)
-            \$ty = [Math]::Max(0, \$rect.Top - 35)
-            \$graphics.FillRectangle(\$tbg, \$tx, \$ty, \$tsize.Width + 20, \$tsize.Height + 10)
-            \$graphics.DrawString(\$title, \$tfont, \$tfg, \$tx + 10, \$ty + 5)
-        }
-        
-        \$pen.Dispose()
-        \$cpen.Dispose()
-    }
-
-    \$rfont = New-Object System.Drawing.Font("Arial", 16, [System.Drawing.FontStyle]::Bold)
-    \$rbg = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(230, 220, 38, 38))
-    \$rfg = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
-    \$rtext = "● RECORDING"
-    \$rsize = \$graphics.MeasureString(\$rtext, \$rfont)
-    \$rx = \$screenWidth - \$rsize.Width - 40
-    \$ry = 20
-    \$graphics.FillRectangle(\$rbg, \$rx, \$ry, \$rsize.Width + 20, \$rsize.Height + 10)
-    \$graphics.DrawString(\$rtext, \$rfont, \$rfg, \$rx + 10, \$ry + 5)
-
-    \$tifont = New-Object System.Drawing.Font("Arial", 12, [System.Drawing.FontStyle]::Bold)
-    \$tibg = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(220, 0, 0, 0))
-    \$tifg = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
-    \$titext = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    \$tisize = \$graphics.MeasureString(\$titext, \$tifont)
-    \$graphics.FillRectangle(\$tibg, 20, \$screenHeight - \$tisize.Height - 30, \$tisize.Width + 20, \$tisize.Height + 10)
-    \$graphics.DrawString(\$titext, \$tifont, \$tifg, 30, \$screenHeight - \$tisize.Height - 25)
-
-    if (\$scale -lt 1.0) {
-        \$smallBitmap = New-Object System.Drawing.Bitmap \$newWidth, \$newHeight
-        \$smallGraphics = [System.Drawing.Graphics]::FromImage(\$smallBitmap)
-        \$smallGraphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        \$smallGraphics.DrawImage(\$bitmap, 0, 0, \$newWidth, \$newHeight)
-        
-        \$jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { \$_.MimeType -eq "image/jpeg" }
-        \$encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
-        \$encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]$_jpegQuality)
-        \$smallBitmap.Save("$tempPathEscaped", \$jpegCodec, \$encoderParams)
-        
-        \$smallGraphics.Dispose()
-        \$smallBitmap.Dispose()
-    } else {
-        \$jpegCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { \$_.MimeType -eq "image/jpeg" }
-        \$encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
-        \$encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]$_jpegQuality)
-        \$bitmap.Save("$tempPathEscaped", \$jpegCodec, \$encoderParams)
-    }
-
-    \$graphics.Dispose()
-    \$bitmap.Dispose()
-
-    Write-Output "SUCCESS"
-} catch {
-    Write-Error \$_.Exception.Message
-    exit 1
-}
-''';
-
-      final scriptFile = File(scriptPath);
-      await scriptFile.writeAsString(psScript);
-
-      final result = await Process.run(
-        'powershell.exe',
-        [
-          '-ExecutionPolicy',
-          'Bypass',
-          '-NoProfile',
-          '-NonInteractive',
-          '-WindowStyle',
-          'Hidden',
-          '-File',
-          scriptPath,
-        ],
-        runInShell: false,
-      ).timeout(const Duration(seconds: 20));
-
+      final imageB64 = await _encodeRawRgbaToPng(pixels, width, height);
+      _captureMethod = 'ffi-win32';
+      _lastCaptureError = '';
+      return imageB64;
+    } catch (e, stack) {
+      _lastCaptureError = 'FFI: $e';
+      debugPrint('FFI capture error: $e\n$stack');
+      return null;
+    } finally {
       try {
-        await scriptFile.delete();
+        if (hOld != 0 && hdcMem != 0) _selectObject(hdcMem, hOld);
+        if (hBitmap != 0) _deleteObject(hBitmap);
+        if (hdcMem != 0) _deleteDC(hdcMem);
+        if (hdcScreen != 0) _releaseDC(0, hdcScreen);
       } catch (_) {}
-
-      if (result.exitCode == 0) {
-        final file = File(tempPath);
-        if (await file.exists()) {
-          final bytes = await file.readAsBytes();
-          try {
-            await file.delete();
-          } catch (_) {}
-
-          if (bytes.isNotEmpty) {
-            _captureMethod = 'win32-jpeg-native';
-            _lastCaptureError = '';
-            return base64Encode(bytes);
-          } else {
-            _lastCaptureError = 'File was empty';
-          }
-        } else {
-          _lastCaptureError = 'File not created';
-        }
-      } else {
-        _lastCaptureError = 'PS exit ${result.exitCode}: ${result.stderr}';
-      }
-    } catch (e) {
-      _lastCaptureError = 'Exception: $e';
-      debugPrint('Windows capture error: $e');
+      if (pixelData != null) calloc.free(pixelData);
+      if (bmi != null) calloc.free(bmi);
     }
-    return null;
   }
 
-  Future<String?> _captureMacDesktop() async {
-    try {
-      final tempDir = await getTemporaryDirectory();
-      final tempPath =
-          '${tempDir.path}/screen_${DateTime.now().millisecondsSinceEpoch}.jpg';
+  Future<String> _encodeRawRgbaToPng(
+      Uint8List rgba, int width, int height) async {
+    final completer = Completer<ui.Image>();
 
-      final result = await Process.run(
-          'screencapture', ['-x', '-t', 'jpg', tempPath]);
-      if (result.exitCode == 0) {
-        final file = File(tempPath);
-        if (await file.exists()) {
-          final bytes = await file.readAsBytes();
-          try {
-            await file.delete();
-          } catch (_) {}
-          _captureMethod = 'mac-native';
-          return base64Encode(bytes);
-        }
-      }
-    } catch (e) {
-      debugPrint('macOS capture error: $e');
-    }
-    return null;
-  }
+    ui.decodeImageFromPixels(
+      rgba,
+      width,
+      height,
+      ui.PixelFormat.rgba8888,
+          (ui.Image image) {
+        if (!completer.isCompleted) completer.complete(image);
+      },
+    );
 
-  Future<String?> _captureLinuxDesktop() async {
-    try {
-      final result = await Process.run(
-          'import', ['-window', 'root', '-quality', '55', 'jpg:-']);
-      if (result.exitCode == 0) {
-        _captureMethod = 'linux-native';
-        return base64Encode(result.stdout as List<int>);
-      }
-    } catch (e) {
-      debugPrint('Linux capture error: $e');
+    final image = await completer.future;
+    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+
+    if (byteData == null) {
+      throw Exception('PNG encoding failed');
     }
-    return null;
+    return base64Encode(byteData.buffer.asUint8List());
   }
 
   Future<String?> _captureFlutterWidget() async {
     try {
       final RenderRepaintBoundary? boundary =
-      _repaintKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
-
+      _repaintKey.currentContext?.findRenderObject()
+      as RenderRepaintBoundary?;
       if (boundary == null) return _generateFallbackPngBase64();
-
       await Future.delayed(const Duration(milliseconds: 20));
       final ui.Image image = await boundary.toImage(pixelRatio: 0.5);
       final ByteData? byteData =
       await image.toByteData(format: ui.ImageByteFormat.png);
-
       if (byteData == null) return _generateFallbackPngBase64();
-
       return base64Encode(byteData.buffer.asUint8List());
     } catch (e) {
-      debugPrint('Flutter capture error: $e');
       return _generateFallbackPngBase64();
     }
   }
@@ -1180,7 +935,6 @@ public class NativeWin32 {
   }
 
   Future<void> _logout() async {
-    // If live, notify server but don't wait (manager-side will detect idle)
     if (_isLive) {
       try {
         await http.post(
@@ -1190,6 +944,9 @@ public class NativeWin32 {
         );
       } catch (_) {}
     }
+
+    await _sendShutdown();
+    _heartbeatTimer?.cancel();
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.clear();
@@ -1206,59 +963,65 @@ public class NativeWin32 {
     final size = MediaQuery.of(context).size;
     final isTablet = size.width > 600;
 
-    return Scaffold(
-      body: Stack(
-        children: [
-          RepaintBoundary(
-            key: _repaintKey,
-            child: Container(
-              width: double.infinity,
-              height: double.infinity,
-              decoration: const BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [
-                    Color(0xFF1A1A2E),
-                    Color(0xFF16213E),
-                    Color(0xFF0F3460)
-                  ],
-                  stops: [0.0, 0.5, 1.0],
+    return Focus(
+      focusNode: _rootFocusNode,
+      autofocus: false,
+      descendantsAreFocusable: false,
+      descendantsAreTraversable: false,
+      child: Scaffold(
+        body: Stack(
+          children: [
+            RepaintBoundary(
+              key: _repaintKey,
+              child: Container(
+                width: double.infinity,
+                height: double.infinity,
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      Color(0xFF1A1A2E),
+                      Color(0xFF16213E),
+                      Color(0xFF0F3460)
+                    ],
+                    stops: [0.0, 0.5, 1.0],
+                  ),
                 ),
-              ),
-              child: SafeArea(
-                child: Column(
-                  children: [
-                    _buildAppBar(),
-                    Expanded(
-                      child: Center(
-                        child: SingleChildScrollView(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 16.0, vertical: 16.0),
-                          child: ConstrainedBox(
-                            constraints: BoxConstraints(
-                                maxWidth: isTablet ? 600 : double.infinity),
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                _buildProfileCard(),
-                                const SizedBox(height: 24),
-                                _buildScreenPreview(),
-                                const SizedBox(height: 24),
-                                _buildSessionStats(),
-                              ],
+                child: SafeArea(
+                  child: Column(
+                    children: [
+                      _buildAppBar(),
+                      Expanded(
+                        child: Center(
+                          child: SingleChildScrollView(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 16.0, vertical: 16.0),
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(
+                                  maxWidth: isTablet ? 600 : double.infinity),
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  _buildProfileCard(),
+                                  const SizedBox(height: 24),
+                                  _buildScreenPreview(),
+                                  const SizedBox(height: 24),
+                                  _buildSessionStats(),
+                                ],
+                              ),
                             ),
                           ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
-          if (_isLive) _buildYellowHighlightOverlay(),
-        ],
+            if (_isLive) _buildYellowHighlightOverlay(),
+          ],
+        ),
       ),
     );
   }
@@ -1312,7 +1075,7 @@ public class NativeWin32 {
                         color: Colors.white,
                         letterSpacing: 0.5)),
                 SizedBox(height: 2),
-                Text('Screen recording (manager-controlled)',
+                Text('Continuous recording active',
                     style: TextStyle(fontSize: 13, color: Colors.white54)),
               ],
             ),
@@ -1472,19 +1235,11 @@ public class NativeWin32 {
               ],
             ),
           ),
-          if (_isFetchingEmployee)
-            const SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(
-                  strokeWidth: 2, color: Color(0xFFE94560)),
-            ),
         ],
       ),
     );
   }
 
-  // ⭐ NO START/STOP BUTTON — only status display
   Widget _buildScreenPreview() {
     return Container(
       width: double.infinity,
@@ -1556,7 +1311,7 @@ public class NativeWin32 {
               const SizedBox(height: 16),
               Text(
                 _isLive
-                    ? 'Screen Recording Active'
+                    ? 'Continuous Recording Active'
                     : 'Waiting for Manager...',
                 style: TextStyle(
                   fontSize: 16,
@@ -1567,8 +1322,8 @@ public class NativeWin32 {
               const SizedBox(height: 6),
               Text(
                 _isLive
-                    ? 'Frames captured: $_successfulUploads  •  Every 1 minute  •  $_captureMethod'
-                    : 'Manager will start recording remotely when needed',
+                    ? 'Frames: $_successfulUploads  •  Failed: $_failedUploads  •  Every ${(_captureIntervalMs / 1000).toInt()}s  •  $_captureMethod'
+                    : 'Recording starts AUTOMATICALLY when manager requests',
                 textAlign: TextAlign.center,
                 style:
                 TextStyle(fontSize: 13, color: Colors.white.withOpacity(0.5)),
@@ -1636,37 +1391,6 @@ public class NativeWin32 {
                   ),
                 ),
               ],
-              const SizedBox(height: 20),
-              // ⭐ NO BUTTON — info only
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(vertical: 14),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(14),
-                  color: Colors.white.withOpacity(0.05),
-                  border: Border.all(color: Colors.white.withOpacity(0.1)),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(
-                      Icons.info_outline,
-                      color: Colors.white.withOpacity(0.5),
-                      size: 20,
-                    ),
-                    const SizedBox(width: 10),
-                    Text(
-                      'Manager controls recording',
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.white.withOpacity(0.6),
-                        letterSpacing: 0.5,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
             ],
           ),
           if (_isLive)

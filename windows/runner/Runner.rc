@@ -1,6 +1,7 @@
 // Microsoft Visual C++ generated resource script.
 //
 #pragma code_page(65001)
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "runner.exe.manifest"
 #include "resource.h"
 
 #define APSTUDIO_READONLY_SYMBOLS
