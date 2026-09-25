@@ -4,7 +4,7 @@ import 'dart:ffi';                    // ⭐ real dart:ffi (DynamicLibrary, Poin
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
-
+import 'package:window_manager/window_manager.dart' as wm;
 import 'package:ffi/ffi.dart' as ffi_pkg;  // ⭐ alias for calloc, Utf16 etc.
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -125,17 +125,27 @@ class _EmpDashboardState extends State<EmpDashboard>
   int _frameCounter = 0;
 
   @override
+  @override
   void initState() {
     super.initState();
     _initFfi();
     WidgetsBinding.instance.addObserver(this);
+
+    // ⭐ Initialize desktop plugins
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+        try { await wm.windowManager.ensureInitialized(); } catch (e) {
+          debugPrint('window_manager init skipped: $e');
+        }
+      }
+    });
+
     _loadInitialUserData();
     _startLiveRequestPolling();
     _startHeartbeat();
     _activeWindowTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (mounted && _isLive) _updateActiveWindowTitle();
     });
-
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkAndRequestPermissionsIfNeeded();
     });
