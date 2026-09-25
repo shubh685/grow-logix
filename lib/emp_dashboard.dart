@@ -64,7 +64,7 @@ class EmpDashboard extends StatefulWidget {
 
 class _EmpDashboardState extends State<EmpDashboard>
     with WidgetsBindingObserver {
-  static const String baseUrl = 'http://192.168.1.42/grow_logix';
+  static const String baseUrl = 'https://goldenrod-raven-866091.hostingersite.com';
   static const String liveStreamUrl = '$baseUrl/live_stream.php';
 
   static const int _captureIntervalMs = 5000;

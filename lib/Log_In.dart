@@ -133,7 +133,7 @@ class LogIn extends StatefulWidget {
   State<LogIn> createState() => _LogInState();
 }
 
-const String _loginApiUrl = 'http://192.168.1.42/grow_logix/login.php';
+const String _loginApiUrl = 'https://goldenrod-raven-866091.hostingersite.com/login.php';
 
 class _LogInState extends State<LogIn> {
   final _formKey = GlobalKey<FormState>();

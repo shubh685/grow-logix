@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
-const String baseUrl = 'http://192.168.1.42/grow_logix/forgot_pwd.php';
+const String baseUrl = 'https://goldenrod-raven-866091.hostingersite.com/forgot_pwd.php';
 
 class ForgotPwd extends StatefulWidget {
   const ForgotPwd({super.key});
