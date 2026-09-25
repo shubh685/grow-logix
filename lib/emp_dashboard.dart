@@ -1,19 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:ffi';
+import 'dart:ffi';                    // ⭐ real dart:ffi (DynamicLibrary, Pointer, calloc)
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:ffi/ffi.dart';
+import 'package:ffi/ffi.dart' as ffi_pkg;  // ⭐ alias for calloc, Utf16 etc.
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
-import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:win32/win32.dart';
+import 'package:win32/win32.dart' as win32;
 
 import 'Log_In.dart';
 
@@ -27,10 +26,12 @@ typedef _CreateCompatibleBitmap_Dart = int Function(int hdc, int width, int heig
 typedef _SelectObject_C = IntPtr Function(IntPtr hdc, IntPtr h);
 typedef _SelectObject_Dart = int Function(int hdc, int h);
 
-typedef _BitBlt_C = Int32 Function(IntPtr hdcDest, Int32 xDest, Int32 yDest, Int32 width,
-    Int32 height, IntPtr hdcSrc, Int32 xSrc, Int32 ySrc, Uint32 rop);
-typedef _BitBlt_Dart = int Function(int hdcDest, int xDest, int yDest, int width,
-    int height, int hdcSrc, int xSrc, int ySrc, int rop);
+typedef _BitBlt_C = Int32 Function(
+    IntPtr hdcDest, Int32 xDest, Int32 yDest, Int32 width, Int32 height,
+    IntPtr hdcSrc, Int32 xSrc, Int32 ySrc, Uint32 rop);
+typedef _BitBlt_Dart = int Function(
+    int hdcDest, int xDest, int yDest, int width, int height,
+    int hdcSrc, int xSrc, int ySrc, int rop);
 
 typedef _DeleteDC_C = Int32 Function(IntPtr hdc);
 typedef _DeleteDC_Dart = int Function(int hdc);
@@ -48,23 +49,11 @@ typedef _GetSystemMetrics_C = Int32 Function(Int32 nIndex);
 typedef _GetSystemMetrics_Dart = int Function(int nIndex);
 
 typedef _GetDIBits_C = Int32 Function(
-    IntPtr hdc,
-    IntPtr hbm,
-    Uint32 start,
-    Uint32 cLines,
-    Pointer<Uint8> lpvBits,
-    Pointer<BITMAPINFO> lpbmi,
-    Uint32 usage,
-    );
+    IntPtr hdc, IntPtr hbm, Uint32 start, Uint32 cLines,
+    Pointer<Uint8> lpvBits, Pointer<win32.BITMAPINFO> lpbmi, Uint32 usage);
 typedef _GetDIBits_Dart = int Function(
-    int hdc,
-    int hbm,
-    int start,
-    int cLines,
-    Pointer<Uint8> lpvBits,
-    Pointer<BITMAPINFO> lpbmi,
-    int usage,
-    );
+    int hdc, int hbm, int start, int cLines,
+    Pointer<Uint8> lpvBits, Pointer<win32.BITMAPINFO> lpbmi, int usage);
 
 class EmpDashboard extends StatefulWidget {
   const EmpDashboard({super.key});
@@ -78,7 +67,6 @@ class _EmpDashboardState extends State<EmpDashboard>
   static const String baseUrl = 'http://192.168.1.42/grow_logix';
   static const String liveStreamUrl = '$baseUrl/live_stream.php';
 
-  // ⭐ CAPTURE INTERVAL: Every 5 seconds for near-live streaming
   static const int _captureIntervalMs = 5000;
   static const String _permSetupKey = 'screen_perm_setup_done_v6';
 
@@ -104,26 +92,29 @@ class _EmpDashboardState extends State<EmpDashboard>
   int _failedUploads = 0;
   bool _isUploading = false;
   String _activeWindowTitle = 'Unknown';
-  String _captureMethod = 'ffi-win32';
+  String _captureMethod = 'initializing';
   String _lastCaptureError = '';
 
   String? _pcType = 'office';
   String? _pcNumber = 'PC-01';
 
+  // ===== FFI state (nullable, so app still runs if anything is missing) =====
   DynamicLibrary? _gdi32;
   DynamicLibrary? _user32;
 
-  late _CreateCompatibleDC_Dart _createCompatibleDC;
-  late _CreateCompatibleBitmap_Dart _createCompatibleBitmap;
-  late _SelectObject_Dart _selectObject;
-  late _BitBlt_Dart _bitBlt;
-  late _DeleteDC_Dart _deleteDC;
-  late _DeleteObject_Dart _deleteObject;
-  late _GetDC_Dart _getDC;
-  late _ReleaseDC_Dart _releaseDC;
-  late _GetSystemMetrics_Dart _getSystemMetrics;
-  late _GetDIBits_Dart _getDIBits;
+  _CreateCompatibleDC_Dart? _createCompatibleDC;
+  _CreateCompatibleBitmap_Dart? _createCompatibleBitmap;
+  _SelectObject_Dart? _selectObject;
+  _BitBlt_Dart? _bitBlt;
+  _DeleteDC_Dart? _deleteDC;
+  _DeleteObject_Dart? _deleteObject;
+  _GetDC_Dart? _getDC;
+  _ReleaseDC_Dart? _releaseDC;
+  _GetSystemMetrics_Dart? _getSystemMetrics;
+  _GetDIBits_Dart? _getDIBits;
+
   bool _ffiReady = false;
+  String _ffiErrorReason = '';
 
   final GlobalKey _repaintKey = GlobalKey();
   final FocusNode _rootFocusNode = FocusNode(
@@ -131,7 +122,6 @@ class _EmpDashboardState extends State<EmpDashboard>
     canRequestFocus: false,
   );
 
-  // Frame counter for server sync
   int _frameCounter = 0;
 
   @override
@@ -166,7 +156,6 @@ class _EmpDashboardState extends State<EmpDashboard>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-
     switch (state) {
       case AppLifecycleState.resumed:
         _sendHeartbeat();
@@ -195,13 +184,11 @@ class _EmpDashboardState extends State<EmpDashboard>
   Future<void> _sendHeartbeat() async {
     if (_employeeId.isEmpty || _employeeId == '---') return;
     try {
-      await http
-          .post(
+      await http.post(
         Uri.parse('$liveStreamUrl?action=heartbeat'),
         headers: {'Content-Type': 'application/json'},
         body: json.encode({'emp_id': _employeeId}),
-      )
-          .timeout(const Duration(seconds: 5));
+      ).timeout(const Duration(seconds: 5));
     } catch (e) {
       debugPrint('Heartbeat error: $e');
     }
@@ -210,25 +197,25 @@ class _EmpDashboardState extends State<EmpDashboard>
   Future<void> _sendShutdown() async {
     if (_employeeId.isEmpty || _employeeId == '---') return;
     try {
-      await http
-          .post(
+      await http.post(
         Uri.parse('$liveStreamUrl?action=app_shutdown'),
         headers: {'Content-Type': 'application/json'},
         body: json.encode({'emp_id': _employeeId}),
-      )
-          .timeout(const Duration(seconds: 3));
+      ).timeout(const Duration(seconds: 3));
     } catch (e) {
       debugPrint('Shutdown notify error: $e');
     }
   }
 
-  // ==================== INIT FFI ====================
+  // ==================== INIT FFI (SAFE) ====================
   void _initFfi() {
     if (!Platform.isWindows) {
-      debugPrint('⚠️ FFI not initialized: not on Windows');
       _captureMethod = 'flutter-only';
+      _ffiErrorReason = 'Not running on Windows';
+      debugPrint('⚠️ FFI skipped: platform is ${Platform.operatingSystem}');
       return;
     }
+
     try {
       _gdi32 = DynamicLibrary.open('gdi32.dll');
       _user32 = DynamicLibrary.open('user32.dll');
@@ -236,8 +223,8 @@ class _EmpDashboardState extends State<EmpDashboard>
       _createCompatibleDC = _gdi32!
           .lookupFunction<_CreateCompatibleDC_C, _CreateCompatibleDC_Dart>(
           'CreateCompatibleDC');
-      _createCompatibleBitmap = _gdi32!
-          .lookupFunction<_CreateCompatibleBitmap_C,
+      _createCompatibleBitmap = _gdi32!.lookupFunction<
+          _CreateCompatibleBitmap_C,
           _CreateCompatibleBitmap_Dart>('CreateCompatibleBitmap');
       _selectObject = _gdi32!
           .lookupFunction<_SelectObject_C, _SelectObject_Dart>('SelectObject');
@@ -246,20 +233,24 @@ class _EmpDashboardState extends State<EmpDashboard>
           _gdi32!.lookupFunction<_DeleteDC_C, _DeleteDC_Dart>('DeleteDC');
       _deleteObject = _gdi32!
           .lookupFunction<_DeleteObject_C, _DeleteObject_Dart>('DeleteObject');
+      _getDIBits =
+          _gdi32!.lookupFunction<_GetDIBits_C, _GetDIBits_Dart>('GetDIBits');
+
       _getDC = _user32!.lookupFunction<_GetDC_C, _GetDC_Dart>('GetDC');
       _releaseDC =
           _user32!.lookupFunction<_ReleaseDC_C, _ReleaseDC_Dart>('ReleaseDC');
       _getSystemMetrics = _user32!
           .lookupFunction<_GetSystemMetrics_C, _GetSystemMetrics_Dart>(
           'GetSystemMetrics');
-      _getDIBits =
-          _gdi32!.lookupFunction<_GetDIBits_C, _GetDIBits_Dart>('GetDIBits');
 
       _ffiReady = true;
+      _captureMethod = 'ffi-win32';
+      _ffiErrorReason = '';
       debugPrint('✅ FFI loaded: gdi32.dll + user32.dll');
     } catch (e) {
       _ffiReady = false;
-      _captureMethod = 'flutter-only';
+      _captureMethod = 'flutter-fallback';
+      _ffiErrorReason = 'FFI load failed: $e';
       debugPrint('❌ FFI load failed: $e');
     }
   }
@@ -322,8 +313,8 @@ class _EmpDashboardState extends State<EmpDashboard>
           ElevatedButton.icon(
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFFE94560),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
+              shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             ),
             onPressed: () async {
               Navigator.pop(ctx);
@@ -375,17 +366,21 @@ class _EmpDashboardState extends State<EmpDashboard>
         if (ffiTest != null && ffiTest.isNotEmpty) {
           results.add('FFI Win32 capture: ✅ OK');
         } else {
-          results.add('FFI Win32 capture: ❌ Failed');
+          results.add('FFI Win32 capture: ⚠️ Unavailable (using fallback)');
+          if (_ffiErrorReason.isNotEmpty) {
+            results.add('  → $_ffiErrorReason');
+          }
           allOk = false;
         }
       } catch (e) {
-        results.add('FFI Win32 capture: ❌ $e');
+        results.add('FFI Win32 capture: ⚠️ $e');
         allOk = false;
       }
 
       try {
         final tempDir = await getTemporaryDirectory();
-        final testFile = File('${tempDir.path}${Platform.pathSeparator}perm_test.txt');
+        final testFile =
+        File('${tempDir.path}${Platform.pathSeparator}perm_test.txt');
         await testFile.writeAsString('test');
         await testFile.delete();
         results.add('Temp folder: ✅ OK');
@@ -404,8 +399,8 @@ class _EmpDashboardState extends State<EmpDashboard>
           context: context,
           builder: (ctx) => AlertDialog(
             backgroundColor: const Color(0xFF16213E),
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(20)),
+            shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
             title: Row(
               children: [
                 Icon(
@@ -443,8 +438,7 @@ class _EmpDashboardState extends State<EmpDashboard>
                   backgroundColor: const Color(0xFFE94560),
                 ),
                 onPressed: () => Navigator.pop(ctx),
-                child:
-                const Text('OK', style: TextStyle(color: Colors.white)),
+                child: const Text('OK', style: TextStyle(color: Colors.white)),
               ),
             ],
           ),
@@ -481,19 +475,26 @@ class _EmpDashboardState extends State<EmpDashboard>
   }
 
   // ==================== HELPERS ====================
+  /// ⭐ FIXED: proper Pointer<Utf16> via wsalloc (which returns Pointer<Utf16>)
   void _updateActiveWindowTitle() {
     if (!Platform.isWindows) return;
+    if (!_ffiReady) return;
     try {
-      final hwnd = GetForegroundWindow();
+      final hwnd = win32.GetForegroundWindow();
       if (hwnd == 0) return;
-      final length = GetWindowTextLength(hwnd);
+      final length = win32.GetWindowTextLength(hwnd);
       if (length == 0) return;
-      final buffer = wsalloc(length + 1);
-      GetWindowText(hwnd, buffer, length + 1);
-      final title = buffer.toDartString();
-      free(buffer);
-      if (mounted && title != _activeWindowTitle) {
-        setState(() => _activeWindowTitle = title);
+
+      // ⭐ wsalloc returns Pointer<Utf16> directly — no cast needed
+      final buffer = win32.wsalloc(length + 1);
+      try {
+        win32.GetWindowText(hwnd, buffer, length + 1);
+        final title = buffer.toDartString();
+        if (mounted && title != _activeWindowTitle) {
+          setState(() => _activeWindowTitle = title);
+        }
+      } finally {
+        win32.free(buffer.cast<Void>());
       }
     } catch (e) {
       debugPrint('Foreground window error: $e');
@@ -609,7 +610,6 @@ class _EmpDashboardState extends State<EmpDashboard>
       _frameCounter = 0;
     });
 
-    // Duration counter
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (mounted && _isLive) {
@@ -619,7 +619,6 @@ class _EmpDashboardState extends State<EmpDashboard>
       }
     });
 
-    // ⭐ START CONTINUOUS CAPTURE
     _startCaptureLoop();
 
     if (mounted) {
@@ -657,59 +656,40 @@ class _EmpDashboardState extends State<EmpDashboard>
     }
   }
 
-  // ⭐ CONTINUOUS CAPTURE LOOP — captures every 5 seconds
   void _startCaptureLoop() {
-    // Cancel any existing timer
     _frameUploadTimer?.cancel();
     _frameUploadTimer = null;
 
-    // Immediate first capture
-    debugPrint('🎬 STARTING CAPTURE LOOP (interval: ${_captureIntervalMs}ms)');
+    debugPrint(
+        '🎬 STARTING CAPTURE LOOP (interval: ${_captureIntervalMs}ms, method: $_captureMethod)');
     _captureAndUpload();
 
-    // Then capture continuously every 5 seconds
     _frameUploadTimer = Timer.periodic(
       const Duration(milliseconds: _captureIntervalMs),
           (timer) async {
-        debugPrint('⏰ Timer tick at ${DateTime.now()}');
         if (!mounted || !_isLive) {
-          debugPrint('⏹️ Stopping capture loop (mounted: $mounted, live: $_isLive)');
           timer.cancel();
           return;
         }
-        if (_isUploading) {
-          debugPrint('⏭️ Skipping frame — previous upload still in progress');
-          return;
-        }
+        if (_isUploading) return;
         await _captureAndUpload();
       },
     );
-
-    debugPrint('✅ Capture loop timer created');
   }
 
   Future<void> _captureAndUpload() async {
-    if (!_isLive) {
-      debugPrint('⏭️ Not live — skipping capture');
-      return;
-    }
-    if (_isUploading) {
-      debugPrint('⏭️ Upload already in progress');
-      return;
-    }
+    if (!_isLive) return;
+    if (_isUploading) return;
 
     _isUploading = true;
     _frameCounter++;
     final captureNum = _successfulUploads + 1;
-    debugPrint('📸 Capturing frame #$captureNum (counter: $_frameCounter)...');
 
     try {
       _updateActiveWindowTitle();
 
-      // PRIMARY: Win32 FFI capture
       String? frameData = await _captureWindowsDesktopFFI();
 
-      // Fallback: Flutter widget
       if (frameData == null || frameData.isEmpty) {
         debugPrint('⚠️ FFI failed, using Flutter fallback');
         _captureMethod = 'flutter-fallback';
@@ -723,11 +703,7 @@ class _EmpDashboardState extends State<EmpDashboard>
         return;
       }
 
-      debugPrint('✅ Captured ${frameData.length} chars');
-
-      // Upload to server
-      final response = await http
-          .post(
+      final response = await http.post(
         Uri.parse('$liveStreamUrl?action=upload_screen_frame'),
         headers: {'Content-Type': 'application/json'},
         body: json.encode({
@@ -740,25 +716,24 @@ class _EmpDashboardState extends State<EmpDashboard>
           'is_live_frame': true,
           'frame_counter': _frameCounter,
         }),
-      )
-          .timeout(const Duration(seconds: 60));
+      ).timeout(const Duration(seconds: 60));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         if (data['status'] == 'success') {
           _successfulUploads++;
           _lastCaptureError = '';
-          debugPrint('✅ Frame #$captureNum uploaded (server ack)');
+          debugPrint('✅ Frame #$captureNum uploaded');
           if (mounted) setState(() {});
         } else {
           _failedUploads++;
-          debugPrint('❌ Server rejected frame: ${data['message']}');
           _lastCaptureError = data['message'] ?? 'Server rejected';
+          debugPrint('❌ Server rejected frame: ${data['message']}');
         }
       } else {
         _failedUploads++;
-        debugPrint('❌ HTTP ${response.statusCode}');
         _lastCaptureError = 'HTTP ${response.statusCode}';
+        debugPrint('❌ HTTP ${response.statusCode}');
       }
     } catch (e) {
       _failedUploads++;
@@ -771,12 +746,28 @@ class _EmpDashboardState extends State<EmpDashboard>
 
   // ==================== PURE FFI WIN32 CAPTURE ====================
   Future<String?> _captureWindowsDesktopFFI() async {
-    if (!Platform.isWindows || !_ffiReady) {
-      if (!_ffiReady) _lastCaptureError = 'FFI not loaded';
+    if (!Platform.isWindows) {
+      _lastCaptureError = 'Not on Windows';
+      return null;
+    }
+    if (!_ffiReady ||
+        _getDC == null ||
+        _getSystemMetrics == null ||
+        _createCompatibleDC == null ||
+        _createCompatibleBitmap == null ||
+        _selectObject == null ||
+        _bitBlt == null ||
+        _getDIBits == null ||
+        _deleteDC == null ||
+        _deleteObject == null ||
+        _releaseDC == null) {
+      _lastCaptureError = _ffiErrorReason.isNotEmpty
+          ? _ffiErrorReason
+          : 'FFI functions not bound';
       return null;
     }
 
-    Pointer<BITMAPINFO>? bmi;
+    Pointer<win32.BITMAPINFO>? bmi;
     Pointer<Uint8>? pixelData;
     int hdcScreen = 0;
     int hdcMem = 0;
@@ -786,47 +777,47 @@ class _EmpDashboardState extends State<EmpDashboard>
     try {
       const SM_CXSCREEN = 0;
       const SM_CYSCREEN = 1;
-      final width = _getSystemMetrics(SM_CXSCREEN);
-      final height = _getSystemMetrics(SM_CYSCREEN);
+      final width = _getSystemMetrics!(SM_CXSCREEN);
+      final height = _getSystemMetrics!(SM_CYSCREEN);
 
       if (width <= 0 || height <= 0) {
         _lastCaptureError = 'Invalid screen size: ${width}x$height';
         return null;
       }
 
-      hdcScreen = _getDC(0);
+      hdcScreen = _getDC!(0);
       if (hdcScreen == 0) {
         _lastCaptureError = 'GetDC returned NULL';
         return null;
       }
 
-      hdcMem = _createCompatibleDC(hdcScreen);
+      hdcMem = _createCompatibleDC!(hdcScreen);
       if (hdcMem == 0) {
         _lastCaptureError = 'CreateCompatibleDC failed';
         return null;
       }
 
-      hBitmap = _createCompatibleBitmap(hdcScreen, width, height);
+      hBitmap = _createCompatibleBitmap!(hdcScreen, width, height);
       if (hBitmap == 0) {
         _lastCaptureError = 'CreateCompatibleBitmap failed';
         return null;
       }
 
-      hOld = _selectObject(hdcMem, hBitmap);
+      hOld = _selectObject!(hdcMem, hBitmap);
 
       const SRCCOPY = 0x00CC0020;
       final bitBltResult =
-      _bitBlt(hdcMem, 0, 0, width, height, hdcScreen, 0, 0, SRCCOPY);
+      _bitBlt!(hdcMem, 0, 0, width, height, hdcScreen, 0, 0, SRCCOPY);
       if (bitBltResult == 0) {
         _lastCaptureError = 'BitBlt failed';
         return null;
       }
 
       final bufSize = width * height * 4;
-      pixelData = calloc<Uint8>(bufSize);
+      pixelData = ffi_pkg.calloc<Uint8>(bufSize);
 
-      bmi = calloc<BITMAPINFO>();
-      bmi.ref.bmiHeader.biSize = sizeOf<BITMAPINFOHEADER>();
+      bmi = ffi_pkg.calloc<win32.BITMAPINFO>();
+      bmi.ref.bmiHeader.biSize = 40;
       bmi.ref.bmiHeader.biWidth = width;
       bmi.ref.bmiHeader.biHeight = -height;
       bmi.ref.bmiHeader.biPlanes = 1;
@@ -839,7 +830,7 @@ class _EmpDashboardState extends State<EmpDashboard>
       bmi.ref.bmiHeader.biClrImportant = 0;
 
       const DIB_RGB_COLORS = 0;
-      final getDIBitsResult = _getDIBits(
+      final getDIBitsResult = _getDIBits!(
           hdcMem, hBitmap, 0, height, pixelData, bmi, DIB_RGB_COLORS);
 
       if (getDIBitsResult == 0) {
@@ -848,7 +839,6 @@ class _EmpDashboardState extends State<EmpDashboard>
       }
 
       final pixels = pixelData.asTypedList(bufSize);
-      // BGRA -> RGBA conversion
       for (int i = 0; i < bufSize; i += 4) {
         final b = pixels[i];
         final g = pixels[i + 1];
@@ -869,13 +859,13 @@ class _EmpDashboardState extends State<EmpDashboard>
       return null;
     } finally {
       try {
-        if (hOld != 0 && hdcMem != 0) _selectObject(hdcMem, hOld);
-        if (hBitmap != 0) _deleteObject(hBitmap);
-        if (hdcMem != 0) _deleteDC(hdcMem);
-        if (hdcScreen != 0) _releaseDC(0, hdcScreen);
+        if (hOld != 0 && hdcMem != 0) _selectObject?.call(hdcMem, hOld);
+        if (hBitmap != 0) _deleteObject?.call(hBitmap);
+        if (hdcMem != 0) _deleteDC?.call(hdcMem);
+        if (hdcScreen != 0) _releaseDC?.call(0, hdcScreen);
       } catch (_) {}
-      if (pixelData != null) calloc.free(pixelData);
-      if (bmi != null) calloc.free(bmi);
+      if (pixelData != null) ffi_pkg.calloc.free(pixelData);
+      if (bmi != null) ffi_pkg.calloc.free(bmi);
     }
   }
 
@@ -1336,8 +1326,8 @@ class _EmpDashboardState extends State<EmpDashboard>
                   decoration: BoxDecoration(
                     color: Colors.red.withOpacity(0.15),
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                        color: Colors.red.withOpacity(0.5), width: 1.5),
+                    border:
+                    Border.all(color: Colors.red.withOpacity(0.5), width: 1.5),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
