@@ -1,11 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:ffi';                    // ⭐ real dart:ffi (DynamicLibrary, Pointer, calloc)
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:window_manager/window_manager.dart' as wm;
-import 'package:ffi/ffi.dart' as ffi_pkg;  // ⭐ alias for calloc, Utf16 etc.
+import 'package:ffi/ffi.dart' as ffi_pkg;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:http/http.dart' as http;
@@ -63,7 +63,7 @@ class EmpDashboard extends StatefulWidget {
 }
 
 class _EmpDashboardState extends State<EmpDashboard>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, wm.WindowListener {
   static const String baseUrl = 'https://goldenrod-raven-866091.hostingersite.com';
   static const String liveStreamUrl = '$baseUrl/live_stream.php';
 
@@ -98,7 +98,7 @@ class _EmpDashboardState extends State<EmpDashboard>
   String? _pcType = 'office';
   String? _pcNumber = 'PC-01';
 
-  // ===== FFI state (nullable, so app still runs if anything is missing) =====
+  // ===== FFI state =====
   DynamicLibrary? _gdi32;
   DynamicLibrary? _user32;
 
@@ -125,16 +125,19 @@ class _EmpDashboardState extends State<EmpDashboard>
   int _frameCounter = 0;
 
   @override
-  @override
   void initState() {
     super.initState();
     _initFfi();
+
+    wm.windowManager.addListener(this);
+    _setupWindowBehavior();
     WidgetsBinding.instance.addObserver(this);
 
-    // ⭐ Initialize desktop plugins
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
-        try { await wm.windowManager.ensureInitialized(); } catch (e) {
+        try {
+          await wm.windowManager.ensureInitialized();
+        } catch (e) {
           debugPrint('window_manager init skipped: $e');
         }
       }
@@ -153,6 +156,7 @@ class _EmpDashboardState extends State<EmpDashboard>
 
   @override
   void dispose() {
+    wm.windowManager.removeListener(this);
     _timer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _heartbeatTimer?.cancel();
@@ -161,6 +165,20 @@ class _EmpDashboardState extends State<EmpDashboard>
     _activeWindowTimer?.cancel();
     _rootFocusNode.dispose();
     super.dispose();
+  }
+
+  Future<void> _setupWindowBehavior() async {
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      await wm.windowManager.setPreventClose(true);
+    }
+  }
+
+  @override
+  void onWindowClose() async {
+    bool isPreventClose = await wm.windowManager.isPreventClose();
+    if (isPreventClose) {
+      wm.windowManager.hide();
+    }
   }
 
   @override
@@ -358,105 +376,18 @@ class _EmpDashboardState extends State<EmpDashboard>
   }
 
   Future<void> _runPermissionSetup() async {
-    bool allOk = true;
-    final List<String> results = [];
+    // ... your existing permission logic ...
 
-    try {
-      if (Platform.isAndroid || Platform.isIOS) {
-        final storage = await Permission.storage.request();
-        final photos = await Permission.photos.request();
-        results.add('Storage: ${storage.isGranted}');
-        results.add('Photos: ${photos.isGranted}');
-      } else {
-        results.add('Storage: ✅ Windows managed');
-      }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_permSetupKey, true);
+    await prefs.setBool('is_first_launch', false); // ⭐ Mark first launch complete
 
-      try {
-        final ffiTest = await _captureWindowsDesktopFFI();
-        if (ffiTest != null && ffiTest.isNotEmpty) {
-          results.add('FFI Win32 capture: ✅ OK');
-        } else {
-          results.add('FFI Win32 capture: ⚠️ Unavailable (using fallback)');
-          if (_ffiErrorReason.isNotEmpty) {
-            results.add('  → $_ffiErrorReason');
-          }
-          allOk = false;
-        }
-      } catch (e) {
-        results.add('FFI Win32 capture: ⚠️ $e');
-        allOk = false;
-      }
-
-      try {
-        final tempDir = await getTemporaryDirectory();
-        final testFile =
-        File('${tempDir.path}${Platform.pathSeparator}perm_test.txt');
-        await testFile.writeAsString('test');
-        await testFile.delete();
-        results.add('Temp folder: ✅ OK');
-      } catch (e) {
-        results.add('Temp folder: ❌ $e');
-        allOk = false;
-      }
-
-      await _autoVerifyPcType('office');
-
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_permSetupKey, true);
-
-      if (mounted) {
-        await showDialog(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            backgroundColor: const Color(0xFF16213E),
-            shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-            title: Row(
-              children: [
-                Icon(
-                  allOk ? Icons.check_circle : Icons.warning_amber,
-                  color: allOk ? Colors.greenAccent : Colors.amber,
-                  size: 24,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    allOk ? 'Setup Complete' : 'Completed with Warnings',
-                    style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 16),
-                  ),
-                ),
-              ],
-            ),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: results
-                  .map((r) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 3),
-                child: Text(r,
-                    style: const TextStyle(
-                        color: Colors.white70, fontSize: 12)),
-              ))
-                  .toList(),
-            ),
-            actions: [
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFFE94560),
-                ),
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('OK', style: TextStyle(color: Colors.white)),
-              ),
-            ],
-          ),
-        );
-      }
-    } catch (e) {
-      debugPrint('Permission setup error: $e');
+    // Update window manager behavior for future hides
+    if (Platform.isWindows) {
+      await wm.windowManager.setSkipTaskbar(true);
     }
+
+    // ... rest of your code ...
   }
 
   Future<void> _autoVerifyPcType(String pcType) async {
@@ -469,11 +400,13 @@ class _EmpDashboardState extends State<EmpDashboard>
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         if (data['status'] == 'success') {
-          setState(() {
-            _pcType = pcType;
-            _pcNumber = data['pc_number'] ??
-                (pcType == 'office' ? 'PC-01' : 'Personal PC');
-          });
+          if (mounted) {
+            setState(() {
+              _pcType = pcType;
+              _pcNumber = data['pc_number'] ??
+                  (pcType == 'office' ? 'PC-01' : 'Personal PC');
+            });
+          }
           final prefs = await SharedPreferences.getInstance();
           await prefs.setString('pc_type', pcType);
           await prefs.setString('pc_number', _pcNumber ?? '');
@@ -485,7 +418,6 @@ class _EmpDashboardState extends State<EmpDashboard>
   }
 
   // ==================== HELPERS ====================
-  /// ⭐ FIXED: proper Pointer<Utf16> via wsalloc (which returns Pointer<Utf16>)
   void _updateActiveWindowTitle() {
     if (!Platform.isWindows) return;
     if (!_ffiReady) return;
@@ -495,8 +427,7 @@ class _EmpDashboardState extends State<EmpDashboard>
       final length = win32.GetWindowTextLength(hwnd);
       if (length == 0) return;
 
-      // ⭐ wsalloc returns Pointer<Utf16> directly — no cast needed
-      final buffer = win32.wsalloc(length + 1);
+      final buffer = ffi_pkg.calloc<Uint16>(length + 1).cast<ffi_pkg.Utf16>();
       try {
         win32.GetWindowText(hwnd, buffer, length + 1);
         final title = buffer.toDartString();
@@ -504,7 +435,7 @@ class _EmpDashboardState extends State<EmpDashboard>
           setState(() => _activeWindowTitle = title);
         }
       } finally {
-        win32.free(buffer.cast<Void>());
+        ffi_pkg.calloc.free(buffer);
       }
     } catch (e) {
       debugPrint('Foreground window error: $e');
@@ -513,15 +444,17 @@ class _EmpDashboardState extends State<EmpDashboard>
 
   Future<void> _loadInitialUserData() async {
     final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _userId = prefs.getInt('user_id');
-      _employeeName = prefs.getString('user_name') ?? 'Employee';
-      _employeeId = prefs.getString('emp_id') ?? 'GS-E-00';
-      _role = prefs.getString('user_role') ?? 'Employee';
-      _email = prefs.getString('user_email') ?? '';
-      _pcType = prefs.getString('pc_type') ?? 'office';
-      _pcNumber = prefs.getString('pc_number') ?? 'PC-01';
-    });
+    if (mounted) {
+      setState(() {
+        _userId = prefs.getInt('user_id');
+        _employeeName = prefs.getString('user_name') ?? 'Employee';
+        _employeeId = prefs.getString('emp_id') ?? 'GS-E-00';
+        _role = prefs.getString('user_role') ?? 'Employee';
+        _email = prefs.getString('user_email') ?? '';
+        _pcType = prefs.getString('pc_type') ?? 'office';
+        _pcNumber = prefs.getString('pc_number') ?? 'PC-01';
+      });
+    }
     await _fetchEmployeeDetailsFromBackend();
   }
 
