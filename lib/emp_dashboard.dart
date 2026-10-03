@@ -13,6 +13,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:win32/win32.dart' as win32;
+import 'package:image/image.dart' as img;
 
 import 'Log_In.dart';
 
@@ -67,8 +68,11 @@ class _EmpDashboardState extends State<EmpDashboard>
   static const String baseUrl = 'https://goldenrod-raven-866091.hostingersite.com';
   static const String liveStreamUrl = '$baseUrl/live_stream.php';
 
-  static const int _captureIntervalMs = 5000;
+  static const int _captureIntervalMs = 200;
   static const String _permSetupKey = 'screen_perm_setup_done_v6';
+  static const int _jpegQuality = 70;
+  static const int _targetWidth = 1280;
+  static const int _targetHeight = 720;
 
   bool _isLive = false;
   Timer? _heartbeatTimer;
@@ -124,6 +128,9 @@ class _EmpDashboardState extends State<EmpDashboard>
 
   int _frameCounter = 0;
 
+  // ⭐ NEW: Reusable HTTP client for keep-alive (faster uploads)
+  final http.Client _httpClient = http.Client();
+
   @override
   void initState() {
     super.initState();
@@ -164,6 +171,7 @@ class _EmpDashboardState extends State<EmpDashboard>
     _frameUploadTimer?.cancel();
     _activeWindowTimer?.cancel();
     _rootFocusNode.dispose();
+    _httpClient.close(); // ⭐ NEW
     super.dispose();
   }
 
@@ -376,18 +384,13 @@ class _EmpDashboardState extends State<EmpDashboard>
   }
 
   Future<void> _runPermissionSetup() async {
-    // ... your existing permission logic ...
-
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_permSetupKey, true);
-    await prefs.setBool('is_first_launch', false); // ⭐ Mark first launch complete
+    await prefs.setBool('is_first_launch', false);
 
-    // Update window manager behavior for future hides
     if (Platform.isWindows) {
       await wm.windowManager.setSkipTaskbar(true);
     }
-
-    // ... rest of your code ...
   }
 
   Future<void> _autoVerifyPcType(String pcType) async {
@@ -567,8 +570,7 @@ class _EmpDashboardState extends State<EmpDashboard>
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text(
-              '🔴 Continuous recording started — captures every 5 seconds'),
+          content: Text('🔴 Continuous recording started'),
           backgroundColor: Colors.green,
           duration: Duration(seconds: 3),
         ),
@@ -646,7 +648,8 @@ class _EmpDashboardState extends State<EmpDashboard>
         return;
       }
 
-      final response = await http.post(
+      // ⭐ Using persistent _httpClient for keep-alive
+      final response = await _httpClient.post(
         Uri.parse('$liveStreamUrl?action=upload_screen_frame'),
         headers: {'Content-Type': 'application/json'},
         body: json.encode({
@@ -659,7 +662,7 @@ class _EmpDashboardState extends State<EmpDashboard>
           'is_live_frame': true,
           'frame_counter': _frameCounter,
         }),
-      ).timeout(const Duration(seconds: 60));
+      ).timeout(const Duration(seconds: 12));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
@@ -687,7 +690,7 @@ class _EmpDashboardState extends State<EmpDashboard>
     }
   }
 
-  // ==================== PURE FFI WIN32 CAPTURE ====================
+  // ==================== PURE FFI WIN32 CAPTURE (HD + FAST) ====================
   Future<String?> _captureWindowsDesktopFFI() async {
     if (!Platform.isWindows) {
       _lastCaptureError = 'Not on Windows';
@@ -720,11 +723,11 @@ class _EmpDashboardState extends State<EmpDashboard>
     try {
       const SM_CXSCREEN = 0;
       const SM_CYSCREEN = 1;
-      final width = _getSystemMetrics!(SM_CXSCREEN);
-      final height = _getSystemMetrics!(SM_CYSCREEN);
+      final srcWidth = _getSystemMetrics!(SM_CXSCREEN);
+      final srcHeight = _getSystemMetrics!(SM_CYSCREEN);
 
-      if (width <= 0 || height <= 0) {
-        _lastCaptureError = 'Invalid screen size: ${width}x$height';
+      if (srcWidth <= 0 || srcHeight <= 0) {
+        _lastCaptureError = 'Invalid screen size: ${srcWidth}x$srcHeight';
         return null;
       }
 
@@ -740,7 +743,7 @@ class _EmpDashboardState extends State<EmpDashboard>
         return null;
       }
 
-      hBitmap = _createCompatibleBitmap!(hdcScreen, width, height);
+      hBitmap = _createCompatibleBitmap!(hdcScreen, srcWidth, srcHeight);
       if (hBitmap == 0) {
         _lastCaptureError = 'CreateCompatibleBitmap failed';
         return null;
@@ -750,19 +753,19 @@ class _EmpDashboardState extends State<EmpDashboard>
 
       const SRCCOPY = 0x00CC0020;
       final bitBltResult =
-      _bitBlt!(hdcMem, 0, 0, width, height, hdcScreen, 0, 0, SRCCOPY);
+      _bitBlt!(hdcMem, 0, 0, srcWidth, srcHeight, hdcScreen, 0, 0, SRCCOPY);
       if (bitBltResult == 0) {
         _lastCaptureError = 'BitBlt failed';
         return null;
       }
 
-      final bufSize = width * height * 4;
+      final bufSize = srcWidth * srcHeight * 4;
       pixelData = ffi_pkg.calloc<Uint8>(bufSize);
 
       bmi = ffi_pkg.calloc<win32.BITMAPINFO>();
       bmi.ref.bmiHeader.biSize = 40;
-      bmi.ref.bmiHeader.biWidth = width;
-      bmi.ref.bmiHeader.biHeight = -height;
+      bmi.ref.bmiHeader.biWidth = srcWidth;
+      bmi.ref.bmiHeader.biHeight = -srcHeight;
       bmi.ref.bmiHeader.biPlanes = 1;
       bmi.ref.bmiHeader.biBitCount = 32;
       bmi.ref.bmiHeader.biCompression = 0;
@@ -774,7 +777,7 @@ class _EmpDashboardState extends State<EmpDashboard>
 
       const DIB_RGB_COLORS = 0;
       final getDIBitsResult = _getDIBits!(
-          hdcMem, hBitmap, 0, height, pixelData, bmi, DIB_RGB_COLORS);
+          hdcMem, hBitmap, 0, srcHeight, pixelData, bmi, DIB_RGB_COLORS);
 
       if (getDIBitsResult == 0) {
         _lastCaptureError = 'GetDIBits failed';
@@ -792,8 +795,16 @@ class _EmpDashboardState extends State<EmpDashboard>
         pixels[i + 3] = 255;
       }
 
-      final imageB64 = await _encodeRawRgbaToPng(pixels, width, height);
-      _captureMethod = 'ffi-win32';
+      final imageB64 = await _encodeRgbaToJpegDownscaled(
+        pixels,
+        srcWidth,
+        srcHeight,
+        _targetWidth,
+        _targetHeight,
+        _jpegQuality,
+      );
+
+      _captureMethod = 'ffi-win32-hd';
       _lastCaptureError = '';
       return imageB64;
     } catch (e, stack) {
@@ -812,28 +823,74 @@ class _EmpDashboardState extends State<EmpDashboard>
     }
   }
 
-  Future<String> _encodeRawRgbaToPng(
-      Uint8List rgba, int width, int height) async {
+  // ⭐ FIXED: Downscale RGBA → JPEG with proper Uint8List conversion
+  Future<String> _encodeRgbaToJpegDownscaled(
+      Uint8List rgba,
+      int srcWidth,
+      int srcHeight,
+      int targetWidth,
+      int targetHeight,
+      int quality) async {
+    // 1. Decode the raw RGBA into a ui.Image
     final completer = Completer<ui.Image>();
-
     ui.decodeImageFromPixels(
       rgba,
-      width,
-      height,
+      srcWidth,
+      srcHeight,
       ui.PixelFormat.rgba8888,
           (ui.Image image) {
         if (!completer.isCompleted) completer.complete(image);
       },
     );
+    final srcImage = await completer.future;
 
-    final image = await completer.future;
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-    image.dispose();
+    // 2. Downscale via Canvas + PictureRecorder (GPU-accelerated)
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
 
-    if (byteData == null) {
-      throw Exception('PNG encoding failed');
+    final paint = Paint()
+      ..filterQuality = FilterQuality.medium
+      ..isAntiAlias = false;
+
+    final srcRect = Rect.fromLTWH(
+        0, 0, srcWidth.toDouble(), srcHeight.toDouble());
+    final dstRect = Rect.fromLTWH(
+        0, 0, targetWidth.toDouble(), targetHeight.toDouble());
+
+    canvas.drawImageRect(srcImage, srcRect, dstRect, paint);
+    final scaledPicture = recorder.endRecording();
+    final scaledImage = await scaledPicture.toImage(targetWidth, targetHeight);
+
+    // 3. Get raw RGBA bytes of the downscaled image
+    final rawBytes = await scaledImage.toByteData(
+      format: ui.ImageByteFormat.rawRgba,
+    );
+
+    // 4. Dispose GPU resources immediately
+    srcImage.dispose();
+    scaledImage.dispose();
+    scaledPicture.dispose();
+
+    if (rawBytes == null) {
+      throw Exception('rawRgba conversion failed');
     }
-    return base64Encode(byteData.buffer.asUint8List());
+
+    // 5. ⭐ FIXED: Convert ByteData.buffer → Uint8List properly
+    final Uint8List rgbaBytes = rawBytes.buffer.asUint8List(
+      rawBytes.offsetInBytes,
+      rawBytes.lengthInBytes,
+    );
+
+    // 6. Encode as JPEG using the `image` package
+    final imgLib = img.Image.fromBytes(
+      width: targetWidth,
+      height: targetHeight,
+      bytes: rgbaBytes.buffer,   // ✅ ByteBuffer is accepted here
+      numChannels: 4,
+    );
+    final jpgBytes = img.encodeJpg(imgLib, quality: quality);
+
+    return base64Encode(jpgBytes);
   }
 
   Future<String?> _captureFlutterWidget() async {
@@ -846,6 +903,7 @@ class _EmpDashboardState extends State<EmpDashboard>
       final ui.Image image = await boundary.toImage(pixelRatio: 0.5);
       final ByteData? byteData =
       await image.toByteData(format: ui.ImageByteFormat.png);
+      image.dispose();
       if (byteData == null) return _generateFallbackPngBase64();
       return base64Encode(byteData.buffer.asUint8List());
     } catch (e) {
@@ -1255,7 +1313,7 @@ class _EmpDashboardState extends State<EmpDashboard>
               const SizedBox(height: 6),
               Text(
                 _isLive
-                    ? 'Frames: $_successfulUploads  •  Failed: $_failedUploads  •  Every ${(_captureIntervalMs / 1000).toInt()}s  •  $_captureMethod'
+                    ? 'Frames: $_successfulUploads  •  Failed: $_failedUploads  •  Every ${(_captureIntervalMs / 1000).toStringAsFixed(1)}s  •  $_captureMethod'
                     : 'Recording starts AUTOMATICALLY when manager requests',
                 textAlign: TextAlign.center,
                 style:
